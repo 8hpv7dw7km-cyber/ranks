@@ -1,15 +1,12 @@
 {
-  "name": "silfer-voice",
+  "name": "main-voice",
   "version": "1.0.0",
-  "description": "Silfer Voice Temporary Rooms",
+  "description": "Main Voice Discord Bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "engines": {
-    "node": ">=20"
-  },
   "dependencies": {
-    "discord.js": "^14.24.2"
+    "discord.js": "^14.22.1"
   }
 }
