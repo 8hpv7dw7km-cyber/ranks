@@ -14,73 +14,99 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  StringSelectMenuBuilder
+  StringSelectMenuBuilder,
+  ActivityType
 } = require("discord.js");
 
 const fs = require("fs");
 const path = require("path");
 
-// ==============================
-// الإعدادات
-// ==============================
+// =====================================
+// MAIN VOICE SETTINGS
+// =====================================
 
-const TOKEN = process.env.TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID;
-const GUILD_ID = process.env.GUILD_ID || "";
+const TOKEN = process.env.TOKEN?.trim();
+const CLIENT_ID = process.env.CLIENT_ID?.trim();
+const GUILD_ID = process.env.GUILD_ID?.trim() || "";
 
 const COLOR = 0x808080;
 const FOOTER = "MAIN VOICE • mian";
 
 if (!TOKEN || !CLIENT_ID) {
-  console.log("❌ ضع TOKEN و CLIENT_ID في متغيرات الاستضافة");
+  console.error("❌ TOKEN أو CLIENT_ID غير موجود");
   process.exit(1);
 }
 
-// ==============================
-// قاعدة البيانات
-// ==============================
+// =====================================
+// DATABASE
+// =====================================
 
-const dataFolder = path.join(__dirname, "data");
-const dataFile = path.join(dataFolder, "voice.json");
+const DATA_DIR = path.join(__dirname, "data");
+const DATA_FILE = path.join(DATA_DIR, "voice.json");
 
-if (!fs.existsSync(dataFolder)) {
-  fs.mkdirSync(dataFolder, { recursive: true });
+if (!fs.existsSync(DATA_DIR)) {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-if (!fs.existsSync(dataFile)) {
-  fs.writeFileSync(
-    dataFile,
-    JSON.stringify({
-      lobbyId: null,
-      panelChannelId: null,
-      panelMessageId: null,
-      rooms: {}
-    }, null, 2)
-  );
+function defaultData() {
+  return {
+    lobbyId: null,
+    panelChannelId: null,
+    panelMessageId: null,
+    rooms: {}
+  };
 }
 
 function loadData() {
   try {
-    return JSON.parse(fs.readFileSync(dataFile, "utf8"));
-  } catch {
+    if (!fs.existsSync(DATA_FILE)) {
+      return defaultData();
+    }
+
+    const parsed = JSON.parse(
+      fs.readFileSync(DATA_FILE, "utf8")
+    );
+
     return {
-      lobbyId: null,
-      panelChannelId: null,
-      panelMessageId: null,
-      rooms: {}
+      ...defaultData(),
+      ...parsed,
+      rooms:
+        parsed.rooms &&
+        typeof parsed.rooms === "object" &&
+        !Array.isArray(parsed.rooms)
+          ? parsed.rooms
+          : {}
     };
+  } catch (error) {
+    console.error("Database error:", error);
+    return defaultData();
   }
 }
 
 let config = loadData();
 
 function saveData() {
-  fs.writeFileSync(dataFile, JSON.stringify(config, null, 2));
+  try {
+    fs.writeFileSync(
+      DATA_FILE,
+      JSON.stringify(config, null, 2),
+      "utf8"
+    );
+  } catch (error) {
+    console.error("Database save error:", error);
+  }
 }
 
-// ==============================
-// البوت
-// ==============================
+// إصلاح البيانات القديمة
+if (!config.rooms || typeof config.rooms !== "object") {
+  config.rooms = {};
+}
+
+saveData();
+
+// =====================================
+// DISCORD CLIENT
+// =====================================
 
 const client = new Client({
   intents: [
@@ -89,11 +115,11 @@ const client = new Client({
   ]
 });
 
-// ==============================
-// أدوات مساعدة
-// ==============================
+// =====================================
+// EMBEDS
+// =====================================
 
-function makeEmbed(title, description) {
+function embed(title, description) {
   return new EmbedBuilder()
     .setColor(COLOR)
     .setTitle(title)
@@ -104,21 +130,25 @@ function makeEmbed(title, description) {
 
 function success(message) {
   return {
-    embeds: [makeEmbed("✅ تمت العملية", message)],
+    embeds: [
+      embed("✅ تمت العملية بنجاح", message)
+    ],
     ephemeral: true
   };
 }
 
-function error(message) {
+function fail(message) {
   return {
-    embeds: [makeEmbed("❌ حدث خطأ", message)],
+    embeds: [
+      embed("❌ تعذر تنفيذ العملية", message)
+    ],
     ephemeral: true
   };
 }
 
-async function getMember(guild, userId) {
-  return guild.members.fetch(userId);
-}
+// =====================================
+// HELPERS
+// =====================================
 
 function isAdmin(member) {
   return member.permissions.has(
@@ -126,10 +156,14 @@ function isAdmin(member) {
   );
 }
 
-async function getRoom(roomId, guild) {
-  const room = config.rooms[roomId];
+async function fetchMember(guild, userId) {
+  return guild.members.fetch(userId);
+}
 
-  if (!room) return null;
+async function getRoom(roomId, guild) {
+  if (!config.rooms || !config.rooms[roomId]) {
+    return null;
+  }
 
   const channel =
     guild.channels.cache.get(roomId) ||
@@ -141,170 +175,184 @@ async function getRoom(roomId, guild) {
     return null;
   }
 
-  return { room, channel };
+  return {
+    channel,
+    room: config.rooms[roomId]
+  };
 }
 
-async function canManageRoom(interaction, roomId) {
-  const guild = interaction.guild;
-  if (!guild) return false;
+async function checkRoomPermission(interaction, roomId) {
+  if (!interaction.guild) return false;
 
-  const member = await getMember(guild, interaction.user.id);
-  const result = await getRoom(roomId, guild);
-
+  const result = await getRoom(roomId, interaction.guild);
   if (!result) return false;
 
-  const { room, channel } = result;
+  const member = await fetchMember(
+    interaction.guild,
+    interaction.user.id
+  );
 
-  const isOwner = room.ownerId === interaction.user.id;
-  const admin = isAdmin(member);
+  if (isAdmin(member)) return true;
 
-  if (!isOwner && !admin) return false;
-
-  if (!admin && member.voice.channelId !== channel.id) {
+  if (result.room.ownerId !== member.id) {
     return false;
   }
 
-  return true;
+  return member.voice.channelId === roomId;
 }
 
-async function replyError(interaction, message) {
-  const payload = error(message);
+async function sendError(interaction, message) {
+  const payload = fail(message);
 
   if (interaction.replied || interaction.deferred) {
-    return interaction.followUp(payload);
+    return interaction.followUp(payload).catch(() => {});
   }
 
-  return interaction.reply(payload);
+  return interaction.reply(payload).catch(() => {});
 }
 
-async function updateOwnerPermissions(channel, ownerId) {
-  await channel.permissionOverwrites.edit(ownerId, {
-    ViewChannel: true,
-    Connect: true
-  }).catch(() => {});
-}
+// =====================================
+// MAIN PANEL
+// =====================================
 
-// ==============================
-// لوحة التحكم
-// ==============================
-
-function mainPanelEmbed() {
-  return makeEmbed(
+function mainEmbed() {
+  return embed(
     "🎙️ MAIN VOICE",
     [
       "مرحباً بك في نظام الرومات الصوتية المؤقتة.",
       "",
-      "**طريقة الاستخدام:**",
-      "1. ادخل روم الانتظار.",
-      "2. سيتم إنشاء روم خاص بك تلقائياً.",
-      "3. استخدم لوحة التحكم لإدارة رومك.",
-      "",
-      "**المميزات:**",
-      "• إنشاء رومات تلقائية.",
-      "• تغيير اسم الروم.",
-      "• تحديد عدد الأعضاء.",
-      "• قفل وفتح الروم.",
-      "• إخفاء وإظهار الروم.",
-      "• طرد الأعضاء ونقل الملكية.",
-      "• حذف الروم تلقائياً عند خلوه.",
-      "",
+      "━━━━━━━━━━━━━━━━━━",
+      "**طريقة الاستخدام**",
+      "① ادخل روم الانتظار.",
+      "② سيتم إنشاء روم صوتي لك تلقائياً.",
+      "③ افتح لوحة التحكم لإدارة رومك.",
+      "━━━━━━━━━━━━━━━━━━",
+      "**مميزات النظام**",
+      "✏️ تغيير اسم الروم",
+      "👥 تحديد عدد الأعضاء",
+      "🔒 قفل وفتح الروم",
+      "🙈 إخفاء وإظهار الروم",
+      "👢 إخراج الأعضاء",
+      "👑 نقل الملكية",
+      "🗑️ حذف الروم",
+      "━━━━━━━━━━━━━━━━━━",
       "اضغط الزر بالأسفل لفتح لوحة التحكم."
     ].join("\n")
   );
 }
 
-function mainPanelRow() {
+function mainButtons() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId("voice_manage")
+      .setCustomId("mainvoice_open")
       .setLabel("لوحة التحكم")
       .setEmoji("🎛️")
       .setStyle(ButtonStyle.Secondary)
   );
 }
 
-function roomPanelEmbed(channel, room) {
-  const locked = channel.permissionOverwrites.cache.get(
-    channel.guild.id
-  )?.deny.has(PermissionsBitField.Flags.Connect);
+// =====================================
+// ROOM PANEL
+// =====================================
 
-  const hidden = channel.permissionOverwrites.cache.get(
+function getRoomStatus(channel) {
+  const everyone = channel.permissionOverwrites.cache.get(
     channel.guild.id
-  )?.deny.has(PermissionsBitField.Flags.ViewChannel);
+  );
 
-  const owner = channel.guild.members.cache.get(room.ownerId);
+  return {
+    locked: everyone?.deny.has(
+      PermissionsBitField.Flags.Connect
+    ) || false,
+
+    hidden: everyone?.deny.has(
+      PermissionsBitField.Flags.ViewChannel
+    ) || false
+  };
+}
+
+function roomEmbed(channel, room) {
+  const status = getRoomStatus(channel);
+
+  const owner =
+    channel.guild.members.cache.get(room.ownerId);
+
+  const ownerText = owner
+    ? owner.user.username
+    : "غير معروف";
 
   const limit = channel.userLimit === 0
     ? "مفتوح"
     : channel.userLimit;
 
-  return makeEmbed(
-    "🎛️ لوحة التحكم الصوتية",
+  return embed(
+    "🎛️ MAIN VOICE | التحكم بالروم",
     [
+      "━━━━━━━━━━━━━━━━━━",
       `**اسم الروم:** ${channel.name}`,
-      `**المالك:** ${owner ? owner.user.tag : room.ownerId}`,
-      `**عدد الموجودين:** ${channel.members.size}`,
+      `**المالك:** ${ownerText}`,
+      `**الأعضاء:** ${channel.members.size}`,
       `**الحد الأقصى:** ${limit}`,
-      "",
-      `**حالة الروم:** ${locked ? "🔒 مقفل" : "🔓 مفتوح"}`,
-      `**الظهور:** ${hidden ? "🙈 مخفي" : "👁️ ظاهر"}`,
-      "",
-      "اختر العملية التي تريد تنفيذها من الأزرار."
+      "━━━━━━━━━━━━━━━━━━",
+      `**القفل:** ${status.locked ? "🔒 مقفل" : "🔓 مفتوح"}`,
+      `**الظهور:** ${status.hidden ? "🙈 مخفي" : "👁️ ظاهر"}`,
+      "━━━━━━━━━━━━━━━━━━",
+      "اختر العملية المطلوبة من الأسفل."
     ].join("\n")
   );
 }
 
-function roomPanelRows(roomId, channel) {
-  const locked = channel.permissionOverwrites.cache.get(
-    channel.guild.id
-  )?.deny.has(PermissionsBitField.Flags.Connect);
-
-  const hidden = channel.permissionOverwrites.cache.get(
-    channel.guild.id
-  )?.deny.has(PermissionsBitField.Flags.ViewChannel);
+function roomButtons(roomId, channel) {
+  const status = getRoomStatus(channel);
 
   const row1 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`vr_rename:${roomId}`)
-      .setLabel("تغيير الاسم")
+      .setCustomId(`mv_rename:${roomId}`)
+      .setLabel("الاسم")
       .setEmoji("✏️")
       .setStyle(ButtonStyle.Secondary),
 
     new ButtonBuilder()
-      .setCustomId(`vr_limit:${roomId}`)
-      .setLabel("تحديد العدد")
+      .setCustomId(`mv_limit:${roomId}`)
+      .setLabel("العدد")
       .setEmoji("👥")
       .setStyle(ButtonStyle.Secondary),
 
     new ButtonBuilder()
-      .setCustomId(`vr_lock:${roomId}`)
-      .setLabel(locked ? "فتح الروم" : "قفل الروم")
-      .setEmoji(locked ? "🔓" : "🔒")
+      .setCustomId(`mv_lock:${roomId}`)
+      .setLabel(status.locked ? "فتح" : "قفل")
+      .setEmoji(status.locked ? "🔓" : "🔒")
       .setStyle(ButtonStyle.Secondary),
 
     new ButtonBuilder()
-      .setCustomId(`vr_hide:${roomId}`)
-      .setLabel(hidden ? "إظهار الروم" : "إخفاء الروم")
-      .setEmoji(hidden ? "👁️" : "🙈")
+      .setCustomId(`mv_hide:${roomId}`)
+      .setLabel(status.hidden ? "إظهار" : "إخفاء")
+      .setEmoji(status.hidden ? "👁️" : "🙈")
       .setStyle(ButtonStyle.Secondary)
   );
 
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`vr_kick:${roomId}`)
+      .setCustomId(`mv_kick:${roomId}`)
       .setLabel("طرد عضو")
       .setEmoji("👢")
       .setStyle(ButtonStyle.Secondary),
 
     new ButtonBuilder()
-      .setCustomId(`vr_transfer:${roomId}`)
+      .setCustomId(`mv_transfer:${roomId}`)
       .setLabel("نقل الملكية")
       .setEmoji("👑")
       .setStyle(ButtonStyle.Secondary),
 
     new ButtonBuilder()
-      .setCustomId(`vr_delete:${roomId}`)
-      .setLabel("حذف الروم")
+      .setCustomId(`mv_refresh:${roomId}`)
+      .setLabel("تحديث")
+      .setEmoji("🔄")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId(`mv_delete:${roomId}`)
+      .setLabel("حذف")
       .setEmoji("🗑️")
       .setStyle(ButtonStyle.Danger)
   );
@@ -312,30 +360,31 @@ function roomPanelRows(roomId, channel) {
   return [row1, row2];
 }
 
-// ==============================
-// إنشاء الروم
-// ==============================
+// =====================================
+// CREATE TEMPORARY ROOM
+// =====================================
 
 async function createRoom(member, lobby) {
   const guild = member.guild;
 
-  // منع إنشاء أكثر من روم للمالك
-  const existing = Object.entries(config.rooms).find(
-    ([id, room]) => room.ownerId === member.id &&
-      guild.channels.cache.has(id)
-  );
+  // البحث عن روم قديم للعضو
+  for (const [roomId, room] of Object.entries(config.rooms)) {
+    if (room.ownerId !== member.id) continue;
 
-  if (existing) {
-    const existingChannel = guild.channels.cache.get(existing[0]);
+    const existing = await guild.channels.fetch(roomId).catch(() => null);
 
-    if (existingChannel) {
-      await member.voice.setChannel(existingChannel).catch(() => {});
+    if (existing && existing.type === ChannelType.GuildVoice) {
+      await member.voice.setChannel(existing).catch(() => {});
       return;
     }
+
+    delete config.rooms[roomId];
   }
 
+  saveData();
+
   const options = {
-    name: `🎙️ ${member.user.username}`,
+    name: `🎙️ ${member.user.username}`.slice(0, 100),
     type: ChannelType.GuildVoice,
     permissionOverwrites: [
       {
@@ -368,41 +417,57 @@ async function createRoom(member, lobby) {
 
   saveData();
 
-  await member.voice.setChannel(channel).catch(async () => {
-    await channel.delete().catch(() => {});
+  try {
+    await member.voice.setChannel(channel);
+  } catch (error) {
+    console.error("Move member error:", error);
+
     delete config.rooms[channel.id];
     saveData();
-  });
+
+    await channel.delete().catch(() => {});
+  }
 }
 
-// ==============================
-// حذف الروم
-// ==============================
+// =====================================
+// DELETE ROOM
+// =====================================
 
 async function deleteRoom(channel) {
   delete config.rooms[channel.id];
   saveData();
 
-  await channel.delete().catch(() => {});
+  await channel.delete().catch(error => {
+    console.error("Delete room error:", error);
+  });
 }
 
-// ==============================
-// تحديث ملكية الروم
-// ==============================
+// =====================================
+// TRANSFER OWNERSHIP
+// =====================================
 
-async function transferOwner(channel, newOwnerId) {
+async function transferOwnership(channel, newOwnerId) {
   const room = config.rooms[channel.id];
   if (!room) return;
+
+  const oldOwnerId = room.ownerId;
+
+  if (oldOwnerId !== newOwnerId) {
+    await channel.permissionOverwrites.delete(oldOwnerId).catch(() => {});
+  }
 
   room.ownerId = newOwnerId;
   saveData();
 
-  await updateOwnerPermissions(channel, newOwnerId);
+  await channel.permissionOverwrites.edit(newOwnerId, {
+    ViewChannel: true,
+    Connect: true
+  });
 }
 
-// ==============================
-// أوامر السلاش
-// ==============================
+// =====================================
+// SLASH COMMANDS
+// =====================================
 
 const commands = [
   new SlashCommandBuilder()
@@ -411,7 +476,7 @@ const commands = [
     .addChannelOption(option =>
       option
         .setName("channel")
-        .setDescription("روم الانتظار الصوتي")
+        .setDescription("اختر روم الانتظار")
         .addChannelTypes(ChannelType.GuildVoice)
         .setRequired(true)
     )
@@ -425,7 +490,7 @@ const commands = [
     .addChannelOption(option =>
       option
         .setName("channel")
-        .setDescription("الروم النصي للوحة")
+        .setDescription("اختر الروم النصي")
         .addChannelTypes(ChannelType.GuildText)
         .setRequired(true)
     )
@@ -435,11 +500,15 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName("voice-status")
-    .setDescription("عرض إعدادات البوت")
+    .setDescription("عرض حالة النظام")
     .setDefaultMemberPermissions(
       PermissionsBitField.Flags.Administrator
     )
 ].map(command => command.toJSON());
+
+// =====================================
+// REGISTER COMMANDS
+// =====================================
 
 async function registerCommands() {
   const rest = new REST({ version: "10" }).setToken(TOKEN);
@@ -459,18 +528,18 @@ async function registerCommands() {
   console.log("✅ تم تسجيل الأوامر");
 }
 
-// ==============================
-// تشغيل البوت
-// ==============================
+// =====================================
+// READY
+// =====================================
 
-client.once("ready", async () => {
+client.once("clientReady", async () => {
   console.log(`✅ ${client.user.tag} is online`);
 
   client.user.setPresence({
     activities: [
       {
         name: "MAIN VOICE • mian",
-        type: 3
+        type: ActivityType.Watching
       }
     ],
     status: "online"
@@ -478,82 +547,91 @@ client.once("ready", async () => {
 
   try {
     await registerCommands();
-  } catch (err) {
-    console.error("Command registration error:", err);
+  } catch (error) {
+    console.error("Register commands error:", error);
   }
 
-  // تنظيف الرومات المحذوفة من قاعدة البيانات
+  // تنظيف قاعدة البيانات من الرومات المحذوفة
   for (const roomId of Object.keys(config.rooms)) {
     const channel = await client.channels.fetch(roomId).catch(() => null);
 
-    if (!channel) {
+    if (!channel || channel.type !== ChannelType.GuildVoice) {
       delete config.rooms[roomId];
     }
   }
 
   saveData();
+
+  console.log("🩶 MAIN VOICE READY");
 });
 
-// ==============================
-// نظام دخول روم الانتظار
-// ==============================
+// =====================================
+// VOICE STATE SYSTEM
+// =====================================
 
 client.on("voiceStateUpdate", async (oldState, newState) => {
   try {
+    // دخول روم الانتظار
     if (
       newState.channelId &&
       newState.channelId === config.lobbyId &&
       oldState.channelId !== newState.channelId
     ) {
-      const member = newState.member;
-      const lobby = newState.channel;
-
-      if (member && lobby) {
-        await createRoom(member, lobby);
+      if (newState.member && newState.channel) {
+        await createRoom(newState.member, newState.channel);
       }
     }
 
-    // إذا خرج عضو من روم مؤقت
-    if (oldState.channelId && config.rooms[oldState.channelId]) {
-      const channel = oldState.channel;
+    // الخروج من روم مؤقت
+    const oldChannelId = oldState.channelId;
 
-      if (!channel) return;
+    if (!oldChannelId || !config.rooms[oldChannelId]) {
+      return;
+    }
 
-      // حذف الروم إذا أصبح فارغاً
-      if (channel.members.size === 0) {
-        await deleteRoom(channel);
-        return;
-      }
+    const channel = oldState.guild.channels.cache.get(oldChannelId);
 
-      const room = config.rooms[channel.id];
+    if (!channel) {
+      delete config.rooms[oldChannelId];
+      saveData();
+      return;
+    }
 
-      // نقل الملكية إذا خرج المالك وبقي أعضاء
-      if (room && oldState.id === room.ownerId) {
-        const nextOwner = channel.members.first();
+    // حذف الروم إذا أصبح فارغاً
+    if (channel.members.size === 0) {
+      await deleteRoom(channel);
+      return;
+    }
 
-        if (nextOwner) {
-          await transferOwner(channel, nextOwner.id);
-        }
+    // نقل الملكية عند خروج المالك
+    const room = config.rooms[oldChannelId];
+
+    if (room && oldState.id === room.ownerId) {
+      const nextOwner = channel.members.first();
+
+      if (nextOwner) {
+        await transferOwnership(channel, nextOwner.id);
       }
     }
-  } catch (err) {
-    console.error("Voice system error:", err);
+
+  } catch (error) {
+    console.error("Voice state error:", error);
   }
 });
 
-// ==============================
-// التفاعلات
-// ==============================
+// =====================================
+// INTERACTIONS
+// =====================================
 
 client.on("interactionCreate", async interaction => {
   try {
+    if (!interaction.guild) return;
 
-    // --------------------------
-    // أوامر السلاش
-    // --------------------------
+    // ---------------------------------
+    // SLASH COMMANDS
+    // ---------------------------------
 
     if (interaction.isChatInputCommand()) {
-      if (!interaction.guild) return;
 
       if (interaction.commandName === "voice-lobby") {
         const channel = interaction.options.getChannel("channel");
@@ -569,8 +647,6 @@ client.on("interactionCreate", async interaction => {
       if (interaction.commandName === "voice-panel") {
         const channel = interaction.options.getChannel("channel");
 
-        config.panelChannelId = channel.id;
-
         let message = null;
 
         if (config.panelMessageId) {
@@ -581,16 +657,17 @@ client.on("interactionCreate", async interaction => {
 
         if (message) {
           await message.edit({
-            embeds: [mainPanelEmbed()],
-            components: [mainPanelRow()]
+            embeds: [mainEmbed()],
+            components: [mainButtons()]
           });
         } else {
           message = await channel.send({
-            embeds: [mainPanelEmbed()],
-            components: [mainPanelRow()]
+            embeds: [mainEmbed()],
+            components: [mainButtons()]
           });
         }
 
+        config.panelChannelId = channel.id;
         config.panelMessageId = message.id;
         saveData();
 
@@ -600,39 +677,33 @@ client.on("interactionCreate", async interaction => {
       }
 
       if (interaction.commandName === "voice-status") {
-        const lobby = config.lobbyId
-          ? `<#${config.lobbyId}>`
-          : "غير محدد";
-
-        const panel = config.panelChannelId
-          ? `<#${config.panelChannelId}>`
-          : "غير محدد";
-
-        const embed = makeEmbed(
-          "⚙️ إعدادات MAIN VOICE",
+        const embedStatus = embed(
+          "⚙️ MAIN VOICE STATUS",
           [
-            `**روم الانتظار:** ${lobby}`,
-            `**لوحة التحكم:** ${panel}`,
-            `**عدد الرومات المؤقتة:** ${Object.keys(config.rooms).length}`,
-            "",
-            `**اسم السيرفر:** mian`,
-            "**اسم البوت:** Main Voice"
+            `**السيرفر:** mian`,
+            `**اسم البوت:** Main Voice`,
+            `**روم الانتظار:** ${config.lobbyId ? `<#${config.lobbyId}>` : "غير محدد"}`,
+            `**لوحة التحكم:** ${config.panelChannelId ? `<#${config.panelChannelId}>` : "غير محدد"}`,
+            `**الرومات النشطة:** ${Object.keys(config.rooms).length}`
           ].join("\n")
         );
 
         return interaction.reply({
-          embeds: [embed],
+          embeds: [embedStatus],
           ephemeral: true
         });
       }
     }
 
-    // --------------------------
-    // زر لوحة التحكم الرئيسية
-    // --------------------------
+    // ---------------------------------
+    // MAIN PANEL BUTTON
+    // ---------------------------------
 
-    if (interaction.isButton() && interaction.customId === "voice_manage") {
-      const member = await getMember(
+    if (
+      interaction.isButton() &&
+      interaction.customId === "mainvoice_open"
+    ) {
+      const member = await fetchMember(
         interaction.guild,
         interaction.user.id
       );
@@ -641,61 +712,65 @@ client.on("interactionCreate", async interaction => {
 
       if (!roomId || !config.rooms[roomId]) {
         return interaction.reply(
-          error("يجب أن تكون داخل رومك الصوتي المؤقت أولاً.")
-        );
-      }
-
-      const room = await getRoom(roomId, interaction.guild);
-
-      if (!room) {
-        return interaction.reply(error("الروم غير موجود."));
-      }
-
-      const admin = isAdmin(member);
-      const owner = room.room.ownerId === member.id;
-
-      if (!owner && !admin) {
-        return interaction.reply(
-          error("هذه اللوحة مخصصة لمالك الروم أو الإدارة.")
-        );
-      }
-
-      return interaction.reply({
-        embeds: [roomPanelEmbed(room.channel, room.room)],
-        components: roomPanelRows(roomId, room.channel),
-        ephemeral: true
-      });
-    }
-
-    // --------------------------
-    // أزرار الرومات
-    // --------------------------
-
-    if (interaction.isButton() && interaction.customId.startsWith("vr_")) {
-      const [action, roomId] = interaction.customId.split(":");
-
-      if (!await canManageRoom(interaction, roomId)) {
-        return interaction.reply(
-          error("لا تملك صلاحية التحكم بهذا الروم، أو أنك لست داخله.")
+          fail("ادخل رومك الصوتي المؤقت أولاً.")
         );
       }
 
       const result = await getRoom(roomId, interaction.guild);
 
       if (!result) {
-        return interaction.reply(error("الروم غير موجود."));
+        return interaction.reply(fail("الروم غير موجود."));
       }
 
-      const { channel } = result;
+      const isOwner = result.room.ownerId === member.id;
+
+      if (!isOwner && !isAdmin(member)) {
+        return interaction.reply(
+          fail("لوحة التحكم مخصصة لمالك الروم أو الإدارة.")
+        );
+      }
+
+      return interaction.reply({
+        embeds: [
+          roomEmbed(result.channel, result.room)
+        ],
+        components: roomButtons(roomId, result.channel),
+        ephemeral: true
+      });
+    }
+
+    // ---------------------------------
+    // ROOM BUTTONS
+    // ---------------------------------
+
+    if (
+      interaction.isButton() &&
+      interaction.customId.startsWith("mv_")
+    ) {
+      const [action, roomId] = interaction.customId.split(":");
+
+      if (!roomId || !await checkRoomPermission(interaction, roomId)) {
+        return interaction.reply(
+          fail("لا تملك صلاحية التحكم بهذا الروم.")
+        );
+      }
+
+      const result = await getRoom(roomId, interaction.guild);
+
+      if (!result) {
+        return interaction.reply(fail("الروم غير موجود."));
+      }
+
+      const { channel, room } = result;
 
       // تغيير الاسم
-      if (action === "vr_rename") {
+      if (action === "mv_rename") {
         const modal = new ModalBuilder()
-          .setCustomId(`voice_rename:${roomId}`)
+          .setCustomId(`mv_modal_rename:${roomId}`)
           .setTitle("تغيير اسم الروم");
 
         const input = new TextInputBuilder()
-          .setCustomId("room_name")
+          .setCustomId("name")
           .setLabel("الاسم الجديد")
           .setPlaceholder("اكتب اسم الروم")
           .setStyle(TextInputStyle.Short)
@@ -710,13 +785,13 @@ client.on("interactionCreate", async interaction => {
       }
 
       // تحديد العدد
-      if (action === "vr_limit") {
+      if (action === "mv_limit") {
         const modal = new ModalBuilder()
-          .setCustomId(`voice_limit:${roomId}`)
+          .setCustomId(`mv_modal_limit:${roomId}`)
           .setTitle("تحديد عدد الأعضاء");
 
         const input = new TextInputBuilder()
-          .setCustomId("room_limit")
+          .setCustomId("limit")
           .setLabel("العدد من 0 إلى 99")
           .setPlaceholder("0 = بدون حد")
           .setStyle(TextInputStyle.Short)
@@ -731,70 +806,87 @@ client.on("interactionCreate", async interaction => {
       }
 
       // قفل وفتح
-      if (action === "vr_lock") {
-        const everyone = channel.guild.id;
-
-        const locked = channel.permissionOverwrites.cache.get(everyone)
-          ?.deny.has(PermissionsBitField.Flags.Connect);
-
-        await channel.permissionOverwrites.edit(everyone, {
-          Connect: locked ? null : false
-        });
+      if (action === "mv_lock") {
+        const status = getRoomStatus(channel);
 
         await channel.permissionOverwrites.edit(
-          result.room.ownerId,
-          { Connect: true, ViewChannel: true }
+          interaction.guild.id,
+          {
+            Connect: status.locked ? null : false
+          }
         );
 
-        return interaction.reply(
-          success(locked ? "تم فتح الروم للجميع." : "تم قفل الروم.")
+        await channel.permissionOverwrites.edit(
+          room.ownerId,
+          {
+            Connect: true,
+            ViewChannel: true
+          }
         );
+
+        return interaction.update({
+          embeds: [roomEmbed(channel, room)],
+          components: roomButtons(roomId, channel)
+        });
       }
 
       // إخفاء وإظهار
-      if (action === "vr_hide") {
-        const everyone = channel.guild.id;
-
-        const hidden = channel.permissionOverwrites.cache.get(everyone)
-          ?.deny.has(PermissionsBitField.Flags.ViewChannel);
-
-        await channel.permissionOverwrites.edit(everyone, {
-          ViewChannel: hidden ? null : false
-        });
+      if (action === "mv_hide") {
+        const status = getRoomStatus(channel);
 
         await channel.permissionOverwrites.edit(
-          result.room.ownerId,
-          { ViewChannel: true, Connect: true }
+          interaction.guild.id,
+          {
+            ViewChannel: status.hidden ? null : false
+          }
         );
 
-        return interaction.reply(
-          success(hidden ? "تم إظهار الروم." : "تم إخفاء الروم.")
+        await channel.permissionOverwrites.edit(
+          room.ownerId,
+          {
+            ViewChannel: true,
+            Connect: true
+          }
         );
+
+        return interaction.update({
+          embeds: [roomEmbed(channel, room)],
+          components: roomButtons(roomId, channel)
+        });
+      }
+
+      // تحديث اللوحة
+      if (action === "mv_refresh") {
+        return interaction.update({
+          embeds: [roomEmbed(channel, room)],
+          components: roomButtons(roomId, channel)
+        });
       }
 
       // طرد عضو
-      if (action === "vr_kick") {
+      if (action === "mv_kick") {
         const members = channel.members.filter(
-          member => member.id !== result.room.ownerId
+          member => member.id !== room.ownerId
         );
 
         if (members.size === 0) {
-          return interaction.reply(error("لا يوجد أعضاء لطردهم."));
+          return interaction.reply(
+            fail("لا يوجد أعضاء آخرون داخل الروم.")
+          );
         }
 
         const menu = new StringSelectMenuBuilder()
-          .setCustomId(`voice_kick:${roomId}`)
-          .setPlaceholder("اختر العضو")
+          .setCustomId(`mv_select_kick:${roomId}`)
+          .setPlaceholder("اختر العضو الذي تريد طرده")
           .addOptions(
             [...members.values()].slice(0, 25).map(member => ({
               label: member.user.username.slice(0, 100),
-              value: member.id,
-              description: "إخراج العضو من الروم"
+              value: member.id
             }))
           );
 
         return interaction.reply({
-          content: "👢 اختر العضو الذي تريد إخراجه:",
+          content: "👢 اختر العضو:",
           components: [
             new ActionRowBuilder().addComponents(menu)
           ],
@@ -803,25 +895,24 @@ client.on("interactionCreate", async interaction => {
       }
 
       // نقل الملكية
-      if (action === "vr_transfer") {
+      if (action === "mv_transfer") {
         const members = channel.members.filter(
           member => member.id !== interaction.user.id
         );
 
         if (members.size === 0) {
           return interaction.reply(
-            error("لا يوجد عضو آخر داخل الروم.")
+            fail("لا يوجد عضو آخر داخل الروم.")
           );
         }
 
         const menu = new StringSelectMenuBuilder()
-          .setCustomId(`voice_transfer:${roomId}`)
+          .setCustomId(`mv_select_transfer:${roomId}`)
           .setPlaceholder("اختر المالك الجديد")
           .addOptions(
             [...members.values()].slice(0, 25).map(member => ({
               label: member.user.username.slice(0, 100),
-              value: member.id,
-              description: "نقل ملكية الروم إليه"
+              value: member.id
             }))
           );
 
@@ -835,112 +926,123 @@ client.on("interactionCreate", async interaction => {
       }
 
       // حذف الروم
-      if (action === "vr_delete") {
-        await interaction.reply(
-          success("سيتم حذف الروم الآن.")
-        );
+      if (action === "mv_delete") {
+        await interaction.update({
+          embeds: [embed("🗑️ حذف الروم", "تم طلب حذف الروم.")],
+          components: []
+        });
 
         await deleteRoom(channel);
         return;
       }
     }
 
-    // --------------------------
-    // القوائم
-    // --------------------------
+    // ---------------------------------
+    // SELECT MENUS
+    // ---------------------------------
 
     if (interaction.isStringSelectMenu()) {
       const [action, roomId] = interaction.customId.split(":");
 
-      if (!await canManageRoom(interaction, roomId)) {
+      if (
+        !roomId ||
+        !await checkRoomPermission(interaction, roomId)
+      ) {
         return interaction.reply(
-          error("لا تملك صلاحية التحكم بهذا الروم.")
+          fail("لا تملك صلاحية التحكم بهذا الروم.")
         );
       }
 
       const result = await getRoom(roomId, interaction.guild);
 
       if (!result) {
-        return interaction.reply(error("الروم غير موجود."));
+        return interaction.reply(fail("الروم غير موجود."));
       }
 
       const { channel, room } = result;
       const selectedId = interaction.values[0];
 
-      if (action === "voice_kick") {
+      if (action === "mv_select_kick") {
         const target = channel.members.get(selectedId);
 
         if (!target) {
-          return interaction.reply(
-            error("هذا العضو لم يعد داخل الروم.")
-          );
+          return interaction.update({
+            content: "❌ العضو لم يعد داخل الروم.",
+            components: []
+          });
         }
 
         if (selectedId === room.ownerId) {
-          return interaction.reply(
-            error("لا يمكنك طرد مالك الروم.")
-          );
+          return interaction.update({
+            content: "❌ لا يمكنك طرد مالك الروم.",
+            components: []
+          });
         }
 
         await target.voice.setChannel(null);
 
         return interaction.update({
-          content: `✅ تم إخراج **${target.user.username}** من الروم.`,
-          components: [],
-          embeds: []
+          content: `✅ تم إخراج ${target.user.username} من الروم.`,
+          components: []
         });
       }
 
-      if (action === "voice_transfer") {
+      if (action === "mv_select_transfer") {
         const target = channel.members.get(selectedId);
 
         if (!target) {
-          return interaction.reply(
-            error("العضو لم يعد داخل الروم.")
-          );
+          return interaction.update({
+            content: "❌ العضو لم يعد داخل الروم.",
+            components: []
+          });
         }
 
-        await transferOwner(channel, selectedId);
+        await transferOwnership(channel, selectedId);
 
         return interaction.update({
-          content: `👑 تم نقل ملكية الروم إلى **${target.user.username}**.`,
-          components: [],
-          embeds: []
+          content: `👑 تم نقل الملكية إلى ${target.user.username}.`,
+          components: []
         });
       }
     }
 
-    // --------------------------
-    // النماذج
-    // --------------------------
+    // ---------------------------------
+    // MODALS
+    // ---------------------------------
 
     if (interaction.isModalSubmit()) {
       const [action, roomId] = interaction.customId.split(":");
 
       if (
-        action !== "voice_rename" &&
-        action !== "voice_limit"
+        action !== "mv_modal_rename" &&
+        action !== "mv_modal_limit"
       ) return;
 
-      if (!await canManageRoom(interaction, roomId)) {
+      if (
+        !roomId ||
+        !await checkRoomPermission(interaction, roomId)
+      ) {
         return interaction.reply(
-          error("لا تملك صلاحية تعديل هذا الروم.")
+          fail("لا تملك صلاحية تعديل هذا الروم.")
         );
       }
 
       const result = await getRoom(roomId, interaction.guild);
 
       if (!result) {
-        return interaction.reply(error("الروم غير موجود."));
+        return interaction.reply(fail("الروم غير موجود."));
       }
 
       const { channel } = result;
 
-      if (action === "voice_rename") {
-        const name = interaction.fields.getTextInputValue("room_name").trim();
+      // حفظ الاسم
+      if (action === "mv_modal_rename") {
+        const name = interaction.fields
+          .getTextInputValue("name")
+          .trim();
 
         if (!name) {
-          return interaction.reply(error("اكتب اسماً صحيحاً."));
+          return interaction.reply(fail("الاسم غير صالح."));
         }
 
         await channel.setName(name);
@@ -950,20 +1052,23 @@ client.on("interactionCreate", async interaction => {
         );
       }
 
-      if (action === "voice_limit") {
-        const value = interaction.fields.getTextInputValue("room_limit").trim();
+      // حفظ العدد
+      if (action === "mv_modal_limit") {
+        const value = interaction.fields
+          .getTextInputValue("limit")
+          .trim();
 
         if (!/^\d{1,2}$/.test(value)) {
           return interaction.reply(
-            error("اكتب رقماً من 0 إلى 99.")
+            fail("اكتب رقماً من 0 إلى 99.")
           );
         }
 
         const limit = Number(value);
 
-        if (limit < 0 || limit > 99) {
+        if (limit > 99) {
           return interaction.reply(
-            error("الحد المسموح من 0 إلى 99.")
+            fail("الحد الأقصى هو 99.")
           );
         }
 
@@ -972,29 +1077,42 @@ client.on("interactionCreate", async interaction => {
         return interaction.reply(
           success(
             limit === 0
-              ? "تم جعل عدد الأعضاء مفتوحاً."
-              : `تم تحديد عدد الأعضاء إلى ${limit}.`
+              ? "تم فتح العدد بدون حد."
+              : `تم تحديد العدد إلى ${limit}.`
           )
         );
       }
     }
 
-  } catch (err) {
-    console.error("Interaction error:", err);
+  } catch (error) {
+    console.error("Interaction error:", error);
 
     if (interaction.isRepliable()) {
-      await replyError(
+      await sendError(
         interaction,
-        "حدث خطأ أثناء تنفيذ العملية. تأكد من صلاحيات البوت."
-      ).catch(() => {});
+        "حدث خطأ. تأكد من صلاحيات البوت وحاول مرة أخرى."
+      );
     }
   }
 });
 
-// ==============================
-// تسجيل الدخول
-// ==============================
+// =====================================
+// ERROR HANDLING
+// =====================================
 
-client.login(TOKEN).catch(err => {
-  console.error("Login error:", err);
+client.on("error", error => {
+  console.error("Discord client error:", error);
+});
+
+process.on("unhandledRejection", error => {
+  console.error("Unhandled rejection:", error);
+});
+
+// =====================================
+// LOGIN
+// =====================================
+
+client.login(TOKEN).catch(error => {
+  console.error("Login failed:", error);
+  process.exit(1);
 });
