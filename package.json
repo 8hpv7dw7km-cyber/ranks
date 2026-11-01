@@ -1,8 +1,7 @@
-
 {
-  "name": "silfer-level",
+  "name": "silfer-voice",
   "version": "1.0.0",
-  "description": "Silfer Level Discord Bot",
+  "description": "Silfer Voice Temporary Rooms",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
